@@ -1,0 +1,70 @@
+create or replace transient table cricket.clean.match_detail_clean as
+select
+infocityvarchar as city,
+case when infoeventstagetext is not null then infoeventstage 
+when infoeventmatch_numberint is not null then infoeventmatch_number
+else 'NA' end as stage,
+infodates[0]date as match_date,
+date_part('year',infodates[0]date) as match_year,
+date_part('month',infodates[0]date) as match_month,
+date_part('day',infodates[0]date) as match_day,
+infoeventnamevarchar as eventplayer_name,
+infoeventmatch_numberint as match_number,
+infogendervarchar as gender,
+infomatch_typevarchar as match_type,
+infomatch_type_numberint as match_type_number,
+case when infooutcomewinner is not null then infooutcomewinner
+else 'NA' end as winner,
+case when infooutcomewinner is not null then 'result declared'
+when infooutcomeresult='tie' then 'tie'
+when infooutcomeresult='no result' then 'no result'
+else infooutcome.result
+end as match_result,
+infooversint as overs,
+infoseasonvarchar as season,
+infoteam_typevarchar as team_type,
+infoteams[0]varchar as first_team,
+infoteams[1]varchar as second_team,
+infotossdecisionvarchar as toss_decision,
+infotosswinnervarchar as toss_winner,
+infovenuevarchar as venue
+from cricket.raw.match_raw_tbl
+where infomatch_type_numberint is not null
+
+create or replace table cricket.clean.player_clean as 
+select 
+raw.infomatch_type_numberint as match_type_number,
+p.keytext as country,
+val.valuetext as player
+from cricket.raw.match_raw_tbl raw,
+lateral flatten (input=raw.infoplayers) p,
+lateral flatten (input=p.value) val
+where raw.infomatch_type_number is not null
+
+select  from cricket.clean.player_clean
+
+alter table cricket.clean.player_clean
+modify column match_type_number set not null;
+
+alter table cricket.clean.player_clean
+modify column country set not null;
+
+alter table cricket.clean.player_clean
+modify column player set not null;
+
+alter table cricket.clean.match_detail_clean
+add constraint pk_match_type_number primary key (match_type_number)
+
+alter table cricket.clean.player_clean
+drop constraint pk_match_type_number
+
+alter table  cricket.clean.player_clean
+add constraint fk_match_type_number
+foreign key (match_type_number)
+references cricket.clean.match_detail_clean (match_type_number);
+
+
+desc table cricket.clean.player_clean
+
+
+select  from cricket.clean.match_detail_clean where match_type_number=4686

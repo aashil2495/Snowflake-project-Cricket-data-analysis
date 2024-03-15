@@ -1,0 +1,44 @@
+create database if not exists cricket;
+create schema cricket.landing;
+create schema cricket.raw;
+create schema cricket.clean;
+create schema cricket.dw;
+
+create or replace file format cricket.landing.json_format
+type=json
+null_if=('\\n','','null')
+strip_outer_array=false
+
+create or replace stage cricket.landing.my_stg;
+
+list @cricket.landing.my_stg;
+
+select $1:meta::variant as meta,
+$1:info::variant as info,
+$1:innings::array as innings,
+metadata$filename as file_name,
+metadata$file_row_number as int,
+metadata$file_content_key as text,
+metadata$file_last_modified as stg_modified_ts
+from @my_stg/cricket/json/1383534.json (file_format =>'json_format');
+
+create transient table cricket.raw.match_raw_tbl(
+meta variant not null,
+info variant not null,
+innings array not null,
+stg_file_name text not null,
+stg_file_row_number int not null,
+stg_file_hashkey text not null,
+stg_modified_ts timestamp not null);
+
+copy into cricket.raw.match_raw_tbl from (
+select $1:meta::variant as meta,
+$1:info::variant as info,
+$1:innings::array as innings,
+metadata$filename as file_name,
+metadata$file_row_number,
+metadata$file_content_key,
+metadata$file_last_modified
+from @cricket.landing.my_stg/cricket/json (file_format => 'cricket.landing.json_format')
+) on_error=continue;    
+

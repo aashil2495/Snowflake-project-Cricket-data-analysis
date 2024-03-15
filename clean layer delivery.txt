@@ -1,0 +1,56 @@
+create or replace table cricket.clean.delivery_clean as
+select 
+raw.info:match_type_number::int as match_type_number,
+i.value:team::text as team,
+o.value:over::int+1 as over,
+d.value:batter::text as batter,
+d.value:bowler::text as bowler,
+d.value:non_striker::text as non_striker,
+d.value:runs:batter::int as batter_runs,
+d.value:runs:extras::int as extras,
+d.value:runs:total::int as total,
+e.key::text as extra_type,
+w.value:kind::text as wicket_kind,
+w.value:player_out::text as player_out,
+f.value:name::text as fielders,
+from cricket.raw.match_raw_tbl raw,
+lateral flatten (input=>raw.innings) i,
+lateral flatten (input=>i.value:overs) o,
+lateral flatten (input=>o.value:deliveries) d,
+lateral flatten (input=>d.value:extras, outer=>True) e,
+lateral flatten (input=>d.value:wickets, outer=>True) w,
+lateral flatten (input=>w.value:fielders, outer=>True) f
+where raw.info:match_type_number is not null
+
+-- select * from cricket.clean.delivery_clean
+
+alter table cricket.clean.delivery_clean
+modify column match_type_number set not null;
+
+alter table cricket.clean.delivery_clean
+modify column team set not null;
+
+alter table cricket.clean.delivery_clean
+modify column over set not null;
+
+alter table cricket.clean.delivery_clean
+modify column batter set not null;
+
+alter table cricket.clean.delivery_clean
+modify column bowler set not null;
+
+alter table cricket.clean.delivery_clean
+modify column non_striker set not null;
+
+alter table cricket.clean.delivery_clean
+add constraint fk_delivery_match_type_number
+foreign key (match_type_number)
+references cricket.clean.match_detail_clean (match_type_number);
+
+select * from cricket.clean.match_detail_clean
+where match_type_number=4686
+
+select count(*) from cricket.clean.delivery_clean
+where match_type_number=4686
+
+

@@ -1,0 +1,213 @@
+create or replace stream cricket.raw.for_match_stream on table cricket.raw.match_raw_tbl append_only=true;
+create or replace stream cricket.raw.for_player_stream on table cricket.raw.match_raw_tbl append_only=true;
+create or replace stream cricket.raw.for_delivery_stream on table cricket.raw.match_raw_tbl append_only=true;
+
+create or replace task cricket.raw.load_json_to_raw
+warehouse='COMPUTE_WH'
+schedule='5 minute'
+as 
+copy into cricket.raw.match_raw_tbl from (
+select $1:meta::variant as meta,
+$1:info::variant as info,
+$1:innings::array as innings,
+metadata$filename as file_name,
+metadata$file_row_number,
+metadata$file_content_key,
+metadata$file_last_modified
+from @cricket.landing.my_stg/cricket/json (file_format => 'cricket.landing.json_format')
+) on_error=continue;    
+
+create or replace task cricket.raw.load_to_clean_match
+warehouse='COMPUTE_WH'
+after cricket.raw.load_json_to_raw
+when system$stream_has_data('cricket.raw.for_match_stream')
+as
+insert into cricket.clean.match_detail_clean
+select
+info:city::varchar as city,
+case when info:event:stage::text is not null then info:event:stage 
+when info:event:match_number::int is not null then info:event:match_number
+else 'NA' end as stage,
+info:dates[0]::date as match_date,
+date_part('year',info:dates[0]::date) as match_year,
+date_part('month',info:dates[0]::date) as match_month,
+date_part('day',info:dates[0]::date) as match_day,
+info:event:name::varchar as eventplayer_name,
+info:event:match_number::int as match_number,
+info:gender::varchar as gender,
+info:match_type::varchar as match_type,
+info:match_type_number::int as match_type_number,
+case when info:outcome:winner is not null then info:outcome:winner
+else 'NA' end as winner,
+case when info:outcome:winner is not null then 'result declared'
+when info:outcome:result='tie' then 'tie'
+when info:outcome:result='no result' then 'no result'
+else info:outcome.result
+end as match_result,
+info:overs::int as overs,
+info:season::varchar as season,
+info:team_type::varchar as team_type,
+info:teams[0]::varchar as first_team,
+info:teams[1]::varchar as second_team,
+info:toss:decision::varchar as toss_decision,
+info:toss:winner::varchar as toss_winner,
+info:venue::varchar as venue
+from cricket.raw.for_match_stream
+
+create or replace task cricket.raw.load_to_clean_player
+warehouse='COMPUTE_WH'
+after cricket.raw.load_to_clean_match
+when system$stream_has_data('cricket.raw.for_player_stream')
+as
+insert into cricket.clean.delivery_clean_tbl
+select 
+raw.info:match_type_number::int as match_type_number,
+p.key::text as country,
+val.value::text as player
+from cricket.raw.for_player_stream raw,
+lateral flatten (input=>raw.info:players) p,
+lateral flatten (input=>p.value) val
+where raw.info:match_type_number is not null
+
+
+
+
+
+
+create or replace task cricket.raw.load_to_clean_delivery
+warehouse='COMPUTE_WH'
+after cricket.raw.load_to_clean_player
+when system$stream_has_data('cricket.raw.for_delivery_stream')
+as
+insert into cricket.clean.delivery_clean
+select
+raw.info:match_type_number::int as match_type_number,
+i.value:team::text as team,
+o.value:over::int+1 as over,
+d.value:batter::text as batter,
+d.value:bowler::text as bowler,
+d.value:non_striker::text as non_striker,
+d.value:runs:batter::int as batter_runs,
+d.value:runs:extras::int as extras,
+d.value:runs:total::int as total,
+e.key::text as extra_type,
+w.value:kind::text as wicket_kind,
+w.value:player_out::text as player_out,
+f.value:name::text as fielders,
+from cricket.raw.for_delivery_stream raw,
+lateral flatten (input=>raw.innings) i,
+lateral flatten (input=>i.value:overs) o,
+lateral flatten (input=>o.value:deliveries) d,
+lateral flatten (input=>d.value:extras, outer=>True) e,
+lateral flatten (input=>d.value:wickets, outer=>True) w,
+lateral flatten (input=>w.value:fielders, outer=>True) f
+where raw.info:match_type_number is not null
+
+
+create or replace task cricket.raw.load_to_team_dim
+warehouse='COMPUTE_WH'
+after cricket.raw.load_to_clean_delivery
+as
+insert into cricket.dw.team_dim (team_name)
+select distinct team_name from (
+select first_team as team_name from cricket.clean.match_detail_clean
+union all
+select second_team as team_name from cricket.clean.match_detail_clean
+)
+select team_name from cricket.dw.team_dim
+
+
+create or replace task cricket.raw.load_to_palyer_dim
+warehouse='COMPUTE_WH'
+after cricket.raw.load_to_clean_delivery
+as
+insert into cricket.dw.player_dim (team_id,player_name)
+select b.team_id,a.player
+from cricket.clean.player_clean a join cricket.dw.team_dim b
+on a.country=b.team_name
+group by b.team_id,a.player
+minus
+select team_id,player_name from cricket.dw.player_dim
+
+create or replace task cricket.raw.load_to_venue_dim
+warehouse='COMPUTE_WH'
+after cricket.raw.load_to_clean_delivery
+as
+insert into cricket.dw.venue_dim (venue_name,city)
+select venue,city from (
+select venue,
+case when city is null then 'NA'
+else city end as city
+from cricket.clean.match_detail_clean
+)
+group by 
+venue,city;
+
+create or replace task cricket.raw.load_match_fact
+warehouse='COMPUTE_WH'
+after cricket.raw.load_to_team_dim,cricket.raw.load_to_player_dim,cricket.raw.load_to_venue_dim
+as
+insert into cricket.dw.match_fact
+select a.* from (
+select
+ m.match_type_number as match_id,
+    dd.date_id as date_id,
+    0 as referee_id,
+    ftd.team_id as team_a_id,
+    std.team_id as team_b_id,
+    mtd.match_type_id as match_type_id,
+    vd.venue_id as venue_id,
+    50 as total_overs,
+    6 as balls_per_overs,
+    max(case when d.team = m.first_team then  d.over else 0 end ) as OVERS_PLAYED_BY_TEAM_A,
+    sum(case when d.team = m.first_team then  1 else 0 end ) as balls_PLAYED_BY_TEAM_A,
+    sum(case when d.team = m.first_team then  d.extras else 0 end ) as extra_balls_PLAYED_BY_TEAM_A,
+    sum(case when d.team = m.first_team then  d.extras else 0 end ) as extra_runs_scored_BY_TEAM_A,
+    0 fours_by_team_a,
+    0 sixes_by_team_a,
+    (sum(case when d.team = m.first_team then  d.total else 0 end ) + sum(case when d.team = m.first_team then  d.extras else 0 end ) ) as total_runs_scored_BY_TEAM_A,
+    sum(case when d.team = m.first_team and player_out is not null then  1 else 0 end ) as wicket_lost_by_team_a,    
+    max(case when d.team = m.second_team then  d.over else 0 end ) as OVERS_PLAYED_BY_TEAM_B,
+    sum(case when d.team = m.second_team then  1 else 0 end ) as balls_PLAYED_BY_TEAM_B,
+    sum(case when d.team = m.second_team then  d.extras else 0 end ) as extra_balls_PLAYED_BY_TEAM_B,
+    sum(case when d.team = m.second_team then  d.extras else 0 end ) as extra_runs_scored_BY_TEAM_B,
+    0 fours_by_team_b,
+    0 sixes_by_team_b,
+    (sum(case when d.team = m.second_team then  d.total else 0 end ) + sum(case when d.team = m.second_team then  d.extras else 0 end ) ) as total_runs_scored_BY_TEAM_B,
+    sum(case when d.team = m.second_team and player_out is not null then  1 else 0 end ) as wicket_lost_by_team_b,
+    tw.team_id as toss_winner_team_id,
+    m.toss_decision as toss_decision,
+    m.match_result as match_result,
+    mw.team_id as winner_team_id ) a
+    left join cricket.dw.match_fact b on a.match_id=b.match_id
+    where b.match_id is null;
+
+
+create or replace task cricket.raw.load_delivery_fact
+warehouse='COMPUTE_WH'
+after cricket.raw.load_match_fact
+as
+insert into cricket.dw.delivery_fact
+select a.* from (
+select 
+d.match_type_number as match_id,
+    td.team_id,
+    bpd.player_id as bower_id, 
+    spd.player_id batter_id, 
+    nspd.player_id as non_stricker_id,
+    d.over,
+    d.total,
+    case when d.extras is null then 0 else d.extras end as extra_runs,
+    case when d.extra_type is null then 'None' else d.extra_type end as extra_type,
+    case when d.player_out is null then 'None' else d.player_out end as player_out,
+    case when d.wicket_kind is null then 'None' else d.wicket_kind end as player_out_kind
+from 
+    cricket.clean.delivery_clean d
+    join team_dim td on d.team = td.team_name
+    join player_dim bpd on d.bowler = bpd.player_name
+    join player_dim spd on d.batter = spd.player_name
+    join player_dim nspd on d.non_striker = nspd.player_name) a
+    left join cricket.dw.delivery_fact b on a.match_id=b.match_id
+    where b.match_id is not null;
+
+
